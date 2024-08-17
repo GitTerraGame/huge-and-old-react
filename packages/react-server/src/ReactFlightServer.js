@@ -16,6 +16,7 @@ import type {TemporaryReferenceSet} from './ReactFlightServerTemporaryReferences
 import {
   enableBinaryFlight,
   enablePostpone,
+  enableHalt,
   enableTaint,
   enableRefAsProp,
   enableServerComponentLogs,
@@ -376,13 +377,13 @@ export type Request = {
   taintCleanupQueue: Array<string | bigint>,
   onError: (error: mixed) => ?string,
   onPostpone: (reason: string) => void,
+  onAllReady: () => void,
+  onFatalError: mixed => void,
   // DEV-only
   environmentName: () => string,
   filterStackFrame: (url: string, functionName: string) => boolean,
   didWarnForKey: null | WeakSet<ReactComponentInfo>,
 };
-
-const AbortSigil = {};
 
 const {
   TaintRegistryObjects,
@@ -437,6 +438,8 @@ function RequestInstance(
   temporaryReferences: void | TemporaryReferenceSet,
   environmentName: void | string | (() => string), // DEV-only
   filterStackFrame: void | ((url: string, functionName: string) => boolean), // DEV-only
+  onAllReady: void | (() => void),
+  onFatalError: void | ((error: mixed) => void),
 ) {
   if (
     ReactSharedInternals.A !== null &&
@@ -488,6 +491,8 @@ function RequestInstance(
   this.onError = onError === undefined ? defaultErrorHandler : onError;
   this.onPostpone =
     onPostpone === undefined ? defaultPostponeHandler : onPostpone;
+  this.onAllReady = onAllReady === undefined ? noop : onAllReady;
+  this.onFatalError = onFatalError === undefined ? noop : onFatalError;
 
   if (__DEV__) {
     this.environmentName =
@@ -515,6 +520,8 @@ function RequestInstance(
   pingedTasks.push(rootTask);
 }
 
+function noop(): void {}
+
 export function createRequest(
   model: ReactClientValue,
   bundlerConfig: ClientManifest,
@@ -524,6 +531,8 @@ export function createRequest(
   temporaryReferences: void | TemporaryReferenceSet,
   environmentName: void | string | (() => string), // DEV-only
   filterStackFrame: void | ((url: string, functionName: string) => boolean), // DEV-only
+  onAllReady: void | (() => void),
+  onFatalError: void | (() => void),
 ): Request {
   // $FlowFixMe[invalid-constructor]: the shapes are exact here but Flow doesn't like constructors
   return new RequestInstance(
@@ -535,6 +544,8 @@ export function createRequest(
     temporaryReferences,
     environmentName,
     filterStackFrame,
+    onAllReady,
+    onFatalError,
   );
 }
 
@@ -594,16 +605,22 @@ function serializeThenable(
         const digest = logRecoverableError(request, x, null);
         emitErrorChunk(request, newTask.id, digest, x);
       }
+      newTask.status = ERRORED;
+      request.abortableTasks.delete(newTask);
       return newTask.id;
     }
     default: {
       if (request.status === ABORTING) {
         // We can no longer accept any resolved values
-        newTask.status = ABORTED;
-        const errorId: number = (request.fatalError: any);
-        const model = stringify(serializeByValueID(errorId));
-        emitModelChunk(request, newTask.id, model);
         request.abortableTasks.delete(newTask);
+        newTask.status = ABORTED;
+        if (enableHalt && request.fatalError === haltSymbol) {
+          emitModelChunk(request, newTask.id, reusableInfinitePromiseModel);
+        } else {
+          const errorId: number = (request.fatalError: any);
+          const model = stringify(serializeByValueID(errorId));
+          emitModelChunk(request, newTask.id, model);
+        }
         return newTask.id;
       }
       if (typeof thenable.status === 'string') {
@@ -650,10 +667,10 @@ function serializeThenable(
         logPostpone(request, postponeInstance.message, newTask);
         emitPostponeChunk(request, newTask.id, postponeInstance);
       } else {
-        newTask.status = ERRORED;
         const digest = logRecoverableError(request, reason, newTask);
         emitErrorChunk(request, newTask.id, digest, reason);
       }
+      newTask.status = ERRORED;
       request.abortableTasks.delete(newTask);
       enqueueFlush(request);
     },
@@ -736,23 +753,32 @@ function serializeReadableStream(
     }
     aborted = true;
     request.abortListeners.delete(error);
-    if (
+
+    let cancelWith: mixed;
+    if (enableHalt && request.fatalError === haltSymbol) {
+      cancelWith = reason;
+    } else if (
       enablePostpone &&
       typeof reason === 'object' &&
       reason !== null &&
       (reason: any).$$typeof === REACT_POSTPONE_TYPE
     ) {
+      cancelWith = reason;
       const postponeInstance: Postpone = (reason: any);
       logPostpone(request, postponeInstance.message, streamTask);
       emitPostponeChunk(request, streamTask.id, postponeInstance);
+      enqueueFlush(request);
     } else {
+      cancelWith = reason;
       const digest = logRecoverableError(request, reason, streamTask);
       emitErrorChunk(request, streamTask.id, digest, reason);
+      enqueueFlush(request);
     }
-    enqueueFlush(request);
+
     // $FlowFixMe should be able to pass mixed
-    reader.cancel(reason).then(error, error);
+    reader.cancel(cancelWith).then(error, error);
   }
+
   request.abortListeners.add(error);
   reader.read().then(progress, error);
   return serializeByValueID(streamTask.id);
@@ -854,24 +880,30 @@ function serializeAsyncIterable(
     }
     aborted = true;
     request.abortListeners.delete(error);
-    if (
+    let throwWith: mixed;
+    if (enableHalt && request.fatalError === haltSymbol) {
+      throwWith = reason;
+    } else if (
       enablePostpone &&
       typeof reason === 'object' &&
       reason !== null &&
       (reason: any).$$typeof === REACT_POSTPONE_TYPE
     ) {
+      throwWith = reason;
       const postponeInstance: Postpone = (reason: any);
       logPostpone(request, postponeInstance.message, streamTask);
       emitPostponeChunk(request, streamTask.id, postponeInstance);
+      enqueueFlush(request);
     } else {
+      throwWith = reason;
       const digest = logRecoverableError(request, reason, streamTask);
       emitErrorChunk(request, streamTask.id, digest, reason);
+      enqueueFlush(request);
     }
-    enqueueFlush(request);
     if (typeof (iterator: any).throw === 'function') {
       // The iterator protocol doesn't necessarily include this but a generator do.
       // $FlowFixMe should be able to pass mixed
-      iterator.throw(reason).then(error, error);
+      iterator.throw(throwWith).then(error, error);
     }
   }
   request.abortListeners.add(error);
@@ -970,6 +1002,7 @@ function callWithDebugContextInDEV<A, T>(
   const componentDebugInfo: ReactComponentInfo = {
     name: '',
     env: task.environmentName,
+    key: null,
     owner: task.debugOwner,
   };
   if (enableOwnerStacks) {
@@ -996,6 +1029,8 @@ function callWithDebugContextInDEV<A, T>(
     setCurrentOwner(null);
   }
 }
+
+const voidHandler = () => {};
 
 function renderFunctionComponent<Props>(
   request: Request,
@@ -1034,6 +1069,7 @@ function renderFunctionComponent<Props>(
       componentDebugInfo = ({
         name: componentName,
         env: componentEnv,
+        key: key,
         owner: task.debugOwner,
       }: ReactComponentInfo);
       if (enableOwnerStacks) {
@@ -1101,10 +1137,19 @@ function renderFunctionComponent<Props>(
   }
 
   if (request.status === ABORTING) {
+    if (
+      typeof result === 'object' &&
+      result !== null &&
+      typeof result.then === 'function' &&
+      !isClientReference(result)
+    ) {
+      result.then(voidHandler, voidHandler);
+    }
     // If we aborted during rendering we should interrupt the render but
     // we don't need to provide an error because the renderer will encode
     // the abort error as the reason.
-    throw AbortSigil;
+    // eslint-disable-next-line no-throw-literal
+    throw null;
   }
 
   if (
@@ -1120,18 +1165,15 @@ function renderFunctionComponent<Props>(
         // If the thenable resolves to an element, then it was in a static position,
         // the return value of a Server Component. That doesn't need further validation
         // of keys. The Server Component itself would have had a key.
-        thenable.then(
-          resolvedValue => {
-            if (
-              typeof resolvedValue === 'object' &&
-              resolvedValue !== null &&
-              resolvedValue.$$typeof === REACT_ELEMENT_TYPE
-            ) {
-              resolvedValue._store.validated = 1;
-            }
-          },
-          () => {},
-        );
+        thenable.then(resolvedValue => {
+          if (
+            typeof resolvedValue === 'object' &&
+            resolvedValue !== null &&
+            resolvedValue.$$typeof === REACT_ELEMENT_TYPE
+          ) {
+            resolvedValue._store.validated = 1;
+          }
+        }, voidHandler);
       }
       if (thenable.status === 'fulfilled') {
         return thenable.value;
@@ -1567,6 +1609,7 @@ function renderElement(
       const componentDebugInfo: ReactComponentInfo = {
         name: 'Fragment',
         env: (0, request.environmentName)(),
+        key: key,
         owner: task.debugOwner,
         stack:
           task.debugStack === null
@@ -1609,7 +1652,8 @@ function renderElement(
           // lazy initializers are user code and could abort during render
           // we don't wan to return any value resolved from the lazy initializer
           // if it aborts so we interrupt rendering here
-          throw AbortSigil;
+          // eslint-disable-next-line no-throw-literal
+          throw null;
         }
         return renderElement(
           request,
@@ -1774,6 +1818,7 @@ function serializeLazyID(id: number): string {
 function serializeInfinitePromise(): string {
   return '$@';
 }
+const reusableInfinitePromiseModel = stringify(serializeInfinitePromise());
 
 function serializePromiseID(id: number): string {
   return '$@' + id.toString(16);
@@ -2042,12 +2087,18 @@ function serializeBlob(request: Request, blob: Blob): string {
     }
     aborted = true;
     request.abortListeners.delete(error);
-    const digest = logRecoverableError(request, reason, newTask);
-    emitErrorChunk(request, newTask.id, digest, reason);
-    request.abortableTasks.delete(newTask);
-    enqueueFlush(request);
+    let cancelWith: mixed;
+    if (enableHalt && request.fatalError === haltSymbol) {
+      cancelWith = reason;
+    } else {
+      cancelWith = reason;
+      const digest = logRecoverableError(request, reason, newTask);
+      emitErrorChunk(request, newTask.id, digest, reason);
+      request.abortableTasks.delete(newTask);
+      enqueueFlush(request);
+    }
     // $FlowFixMe should be able to pass mixed
-    reader.cancel(reason).then(error, error);
+    reader.cancel(cancelWith).then(error, error);
   }
 
   request.abortListeners.add(error);
@@ -2125,6 +2176,9 @@ function renderModel(
       if (typeof x.then === 'function') {
         if (request.status === ABORTING) {
           task.status = ABORTED;
+          if (enableHalt && request.fatalError === haltSymbol) {
+            return serializeInfinitePromise();
+          }
           const errorId: number = (request.fatalError: any);
           if (wasReactNode) {
             return serializeLazyID(errorId);
@@ -2176,8 +2230,11 @@ function renderModel(
       }
     }
 
-    if (thrownValue === AbortSigil) {
+    if (request.status === ABORTING) {
       task.status = ABORTED;
+      if (enableHalt && request.fatalError === haltSymbol) {
+        return serializeInfinitePromise();
+      }
       const errorId: number = (request.fatalError: any);
       if (wasReactNode) {
         return serializeLazyID(errorId);
@@ -2350,7 +2407,8 @@ function renderModelDestructive(
           // lazy initializers are user code and could abort during render
           // we don't wan to return any value resolved from the lazy initializer
           // if it aborts so we interrupt rendering here
-          throw AbortSigil;
+          // eslint-disable-next-line no-throw-literal
+          throw null;
         }
         if (__DEV__) {
           const debugInfo: ?ReactDebugInfo = lazy._debugInfo;
@@ -2605,6 +2663,7 @@ function renderModelDestructive(
         > = {
           name: (value: any).name,
           env: (value: any).env,
+          key: (value: any).key,
           owner: (value: any).owner,
         };
         if (enableOwnerStacks) {
@@ -2876,6 +2935,8 @@ function logRecoverableError(
 }
 
 function fatalError(request: Request, error: mixed): void {
+  const onFatalError = request.onFatalError;
+  onFatalError(error);
   if (enableTaint) {
     cleanupTaintQueue(request);
   }
@@ -3277,6 +3338,7 @@ function renderConsoleValue(
       > = {
         name: (value: any).name,
         env: (value: any).env,
+        key: (value: any).key,
         owner: (value: any).owner,
       };
       if (enableOwnerStacks) {
@@ -3662,9 +3724,13 @@ function retryTask(request: Request, task: Task): void {
         if (request.status === ABORTING) {
           request.abortableTasks.delete(task);
           task.status = ABORTED;
-          const errorId: number = (request.fatalError: any);
-          const model = stringify(serializeByValueID(errorId));
-          emitModelChunk(request, task.id, model);
+          if (enableHalt && request.fatalError === haltSymbol) {
+            emitModelChunk(request, task.id, reusableInfinitePromiseModel);
+          } else {
+            const errorId: number = (request.fatalError: any);
+            const model = stringify(serializeByValueID(errorId));
+            emitModelChunk(request, task.id, model);
+          }
           return;
         }
         // Something suspended again, let's pick it back up later.
@@ -3683,12 +3749,16 @@ function retryTask(request: Request, task: Task): void {
       }
     }
 
-    if (x === AbortSigil) {
+    if (request.status === ABORTING) {
       request.abortableTasks.delete(task);
       task.status = ABORTED;
-      const errorId: number = (request.fatalError: any);
-      const model = stringify(serializeByValueID(errorId));
-      emitModelChunk(request, task.id, model);
+      if (enableHalt && request.fatalError === haltSymbol) {
+        emitModelChunk(request, task.id, reusableInfinitePromiseModel);
+      } else {
+        const errorId: number = (request.fatalError: any);
+        const model = stringify(serializeByValueID(errorId));
+        emitModelChunk(request, task.id, model);
+      }
       return;
     }
 
@@ -3738,6 +3808,11 @@ function performWork(request: Request): void {
     if (request.destination !== null) {
       flushCompletedChunks(request, request.destination);
     }
+    if (request.abortableTasks.size === 0) {
+      // we're done rendering
+      const onAllReady = request.onAllReady;
+      onAllReady();
+    }
   } catch (error) {
     logRecoverableError(request, error, null);
     fatalError(request, error);
@@ -3759,6 +3834,15 @@ function abortTask(task: Task, request: Request, errorId: number): void {
   const ref = serializeByValueID(errorId);
   const processedChunk = encodeReferenceChunk(request, task.id, ref);
   request.completedErrorChunks.push(processedChunk);
+}
+
+function haltTask(task: Task, request: Request): void {
+  if (task.status === RENDERING) {
+    // This task will be aborted by the render
+    return;
+  }
+  task.status = ABORTED;
+  emitModelChunk(request, task.id, reusableInfinitePromiseModel);
 }
 
 function flushCompletedChunks(
@@ -3902,7 +3986,9 @@ export function stopFlowing(request: Request): void {
 // This is called to early terminate a request. It creates an error at all pending tasks.
 export function abort(request: Request, reason: mixed): void {
   try {
-    request.status = ABORTING;
+    if (request.status === OPEN) {
+      request.status = ABORTING;
+    }
     const abortableTasks = request.abortableTasks;
     // We have tasks to abort. We'll emit one error row and then emit a reference
     // to that row from every row that's still remaining.
@@ -3966,6 +4052,38 @@ export function abort(request: Request, reason: mixed): void {
               : reason;
       }
       abortListeners.forEach(callback => callback(error));
+      abortListeners.clear();
+    }
+    if (request.destination !== null) {
+      flushCompletedChunks(request, request.destination);
+    }
+  } catch (error) {
+    logRecoverableError(request, error, null);
+    fatalError(request, error);
+  }
+}
+
+const haltSymbol = Symbol('halt');
+
+// This is called to stop rendering without erroring. All unfinished work is represented Promises
+// that never resolve.
+export function halt(request: Request, reason: mixed): void {
+  try {
+    if (request.status === OPEN) {
+      request.status = ABORTING;
+    }
+    request.fatalError = haltSymbol;
+    const abortableTasks = request.abortableTasks;
+    // We have tasks to abort. We'll emit one error row and then emit a reference
+    // to that row from every row that's still remaining.
+    if (abortableTasks.size > 0) {
+      request.pendingChunks++;
+      abortableTasks.forEach(task => haltTask(task, request));
+      abortableTasks.clear();
+    }
+    const abortListeners = request.abortListeners;
+    if (abortListeners.size > 0) {
+      abortListeners.forEach(callback => callback(reason));
       abortListeners.clear();
     }
     if (request.destination !== null) {
